@@ -1,0 +1,16 @@
+# Ignore everything by default.
+*
+
+# Allow only top-level version directories and source/document files.
+!/.gitignore
+!/Code_2026-05-29/
+!/Code_2025-06-03/
+!/Code_2026-05-29/*.py
+!/Code_2026-05-29/*.sh
+!/Code_2026-05-29/*.md
+!/Code_2025-06-03/*.py
+!/Code_2025-06-03/*.sh
+!/Code_2025-06-03/*.md
+
+# Keep every nested directory ignored.
+/*/*/
