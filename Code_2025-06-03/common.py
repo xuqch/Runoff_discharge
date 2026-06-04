@@ -26,23 +26,58 @@ def seed_everything(seed: int) -> None:
     set_seed(int(seed))
 
 
-def setup_distributed(local_rank: int = 0):
+def get_local_rank(default: int | None = 0) -> int:
+    for key in ("LOCAL_RANK", "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK"):
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            return int(value)
+    return int(0 if default is None else default)
+
+
+def setup_distributed(local_rank: int | None = None):
     import torch
     import torch.distributed as dist
 
+    local_rank = get_local_rank(local_rank)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     if world_size > 1 and not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-    return rank, world_size, world_size > 1
+        if backend == "nccl":
+            torch.cuda.set_device(local_rank)
+            try:
+                dist.init_process_group(backend=backend, device_id=torch.device(f"cuda:{local_rank}"))
+            except TypeError:
+                dist.init_process_group(backend=backend)
+        else:
+            dist.init_process_group(backend=backend)
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    return rank, world_size, world_size > 1, local_rank
+
+
+def ddp_barrier(local_rank: Optional[int] = None) -> None:
+    import torch
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        local_rank = get_local_rank(local_rank)
+        dist.barrier(device_ids=[int(local_rank)])
+    else:
+        dist.barrier()
 
 
 def cleanup_distributed() -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 def is_main_process() -> bool:
@@ -72,6 +107,7 @@ def save_checkpoint(
     completed_epoch: int,
     global_step: int,
     best_loss: float,
+    best_epoch: int,
     config: Dict,
 ) -> None:
     import torch
@@ -88,6 +124,7 @@ def save_checkpoint(
             "completed_epoch": int(completed_epoch),
             "global_step": int(global_step),
             "best_loss": float(best_loss),
+            "best_epoch": int(best_epoch),
             "config": config,
         },
         path,

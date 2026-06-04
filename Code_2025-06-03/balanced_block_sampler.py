@@ -53,12 +53,33 @@ class BalancedBlockDistributedSampler(Sampler[int]):
         self._sample_indices = list(range(len(dataset)))
         self._sample_loads = [int(v) for v in getattr(dataset, "sample_loads", [1] * len(dataset))]
         self._rank_partitions = self._partition_by_load()
-        self.num_samples = self._compute_num_samples(len(self._rank_partitions[self.rank]))
+        self.raw_counts = [len(indices) for indices in self._rank_partitions]
+        self.raw_loads = [
+            sum(max(1, self._sample_loads[idx]) for idx in indices)
+            for indices in self._rank_partitions
+        ]
+        self.num_samples = self._compute_global_num_samples()
 
-    def _compute_num_samples(self, sample_count: int) -> int:
+    def _ceil_to_batch(self, n: int) -> int:
+        if n <= 0:
+            return 0
+        return int(math.ceil(n / self.batch_size)) * self.batch_size
+
+    def _floor_to_batch(self, n: int) -> int:
+        return (n // self.batch_size) * self.batch_size
+
+    def _compute_global_num_samples(self) -> int:
+        counts = [len(indices) for indices in self._rank_partitions]
         if self.drop_last:
-            return (sample_count // self.batch_size) * self.batch_size
-        return int(math.ceil(sample_count / self.batch_size)) * self.batch_size if sample_count else 0
+            n = min(self._floor_to_batch(count) for count in counts)
+        else:
+            n = max(self._ceil_to_batch(count) for count in counts)
+        if n <= 0:
+            raise RuntimeError(
+                "BalancedBlockDistributedSampler produced empty local epoch: "
+                f"counts={counts}, batch_size={self.batch_size}, drop_last={self.drop_last}"
+            )
+        return int(n)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -111,12 +132,15 @@ class BalancedBlockDistributedSampler(Sampler[int]):
     def _rank_indices_for_epoch(self) -> List[int]:
         indices = self._order_rank_indices(list(self._rank_partitions[self.rank]))
         if self.drop_last:
-            usable = (len(indices) // self.batch_size) * self.batch_size
-            return indices[:usable]
+            return indices[:self.num_samples]
 
-        padding = (-len(indices)) % self.batch_size
-        if padding > 0 and indices:
-            indices = indices + indices[:padding]
+        if not indices:
+            raise RuntimeError(f"Rank {self.rank} has no samples to pad.")
+        if len(indices) < self.num_samples:
+            repeat = math.ceil(self.num_samples / len(indices))
+            indices = (indices * repeat)[:self.num_samples]
+        else:
+            indices = indices[:self.num_samples]
         return indices
 
     def __iter__(self) -> Iterator[int]:

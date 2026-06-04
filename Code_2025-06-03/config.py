@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -37,7 +38,7 @@ def get_args() -> Dict:
     parser = argparse.ArgumentParser(description="06-03 simplified global runoff training with per-basin H5 blocks.")
 
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", "0")))
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--data_dir", type=str, default="/data/xuqch3/LSTM_Runoff/Experiment_for_runoff/Global")
@@ -120,7 +121,7 @@ def get_args() -> Dict:
 
     parser.add_argument("--balanced_sampler", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--balanced_bucket_size", type=int, default=16)
-    parser.add_argument("--balanced_sampler_drop_last", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--balanced_sampler_drop_last", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--balanced_sampler_seed", type=int, default=0)
 
     parser.add_argument("--generator_chunk_size", type=int, default=8192)
@@ -169,11 +170,54 @@ def _resolve_file(path_like: str | Path, *roots: Path) -> Path:
 
 
 def _bootstrap_run_defaults(cfg: Dict) -> None:
+    code_dir = Path(__file__).resolve().parent
+    repo_runs_dir = code_dir / "runs"
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    if world_size > 1:
+        rank = int(os.environ.get("RANK", "0"))
+        run_id = (
+            os.environ.get("TORCHELASTIC_RUN_ID")
+            or os.environ.get("RDZV_ID")
+            or os.environ.get("MASTER_PORT")
+            or f"pid_{os.getppid()}"
+        )
+        bootstrap_file = repo_runs_dir / "temp" / "ddp_bootstrap" / f"{run_id}.json"
+
+        if rank == 0:
+            payload: Dict[str, object] = {}
+            payload["seed"] = int(cfg["seed"]) if cfg.get("seed") is not None else int(np.random.uniform(low=0, high=1000))
+
+            raw_run_dir = cfg.get("run_dir") or cfg.get("output_dir")
+            if raw_run_dir is None:
+                now = datetime.now()
+                run_name = f"run_{now.month:02d}{now.day:02d}_{now.hour + 8:02d}{now.minute:02d}_seed{int(payload['seed'])}"
+                payload["run_dir"] = str(repo_runs_dir / run_name)
+            else:
+                path = Path(str(raw_run_dir)).expanduser()
+                payload["run_dir"] = str(path if path.is_absolute() else repo_runs_dir / path)
+
+            _save_json(bootstrap_file, payload)
+            cfg["seed"] = int(payload["seed"])
+            cfg["run_dir"] = Path(str(payload["run_dir"]))
+            cfg["output_dir"] = cfg["run_dir"]
+            return
+
+        start_time = time.time()
+        while not bootstrap_file.exists():
+            if time.time() - start_time > 300:
+                raise TimeoutError(f"Timed out waiting for distributed bootstrap file: {bootstrap_file}")
+            time.sleep(0.2)
+
+        payload = _load_json(bootstrap_file)
+        cfg["seed"] = int(payload["seed"])
+        cfg["run_dir"] = Path(str(payload["run_dir"]))
+        cfg["output_dir"] = cfg["run_dir"]
+        return
+
     if cfg.get("seed") is None:
         cfg["seed"] = int(np.random.uniform(low=0, high=1000))
 
-    code_dir = Path(__file__).resolve().parent
-    repo_runs_dir = code_dir / "runs"
     if cfg.get("run_dir") is None and cfg.get("output_dir") is None:
         now = datetime.now()
         run_name = f"run_phaseh_{now.month:02d}{now.day:02d}_{now.hour + 8:02d}{now.minute:02d}_seed{cfg['seed']}"

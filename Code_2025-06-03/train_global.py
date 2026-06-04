@@ -16,6 +16,7 @@ from common import (
     build_or_update_h5_if_needed,
     cleanup_distributed,
     configure_run_artifact_dirs,
+    ddp_barrier,
     find_latest_checkpoint,
     is_main_process,
     load_checkpoint,
@@ -117,6 +118,7 @@ def setup_run_dir(cfg: Dict) -> Dict:
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     cfg["out_dir"] = cfg["run_dir"]
     cfg["ckpt_dir"].mkdir(parents=True, exist_ok=True)
+    print(cfg["run_dir"])
     return cfg
 
 
@@ -132,7 +134,9 @@ def resolve_resume_path(cfg: Dict) -> Path | None:
 
 
 def build_loader(cfg: Dict, rank: int, world_size: int, ddp_enabled: bool) -> Tuple[BlockPerBasinH5Dataset, DataLoader, object | None]:
+    print(cfg["basins_file"])
     basins = read_basin_ids(cfg["basins_file"])
+    print(len(basins))
     dataset = BlockPerBasinH5Dataset(
         h5_path=cfg["h5_dir"],
         scalers_path=cfg["scalers_path"],
@@ -154,7 +158,7 @@ def build_loader(cfg: Dict, rank: int, world_size: int, ddp_enabled: bool) -> Tu
             shuffle=shuffle,
             seed=int(cfg.get("balanced_sampler_seed", 0)),
             bucket_size=int(cfg.get("balanced_bucket_size", 16)),
-            drop_last=bool(cfg.get("balanced_sampler_drop_last", True)),
+            drop_last=bool(cfg.get("balanced_sampler_drop_last", False)),
         )
         shuffle = False
     elif ddp_enabled:
@@ -204,6 +208,25 @@ def reduce_epoch_stats(loss_sum: float, step_count: int, device: torch.device) -
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return float(tensor[0].item()), int(tensor[1].item())
     return loss_sum, step_count
+
+
+def shutdown_dataloader(loader) -> None:
+    if loader is None:
+        return
+
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
+
+    try:
+        loader._iterator = None
+    except Exception:
+        pass
 
 
 def train_one_epoch(
@@ -284,16 +307,24 @@ def train(cfg: Dict) -> None:
     configure_run_artifact_dirs(cfg["run_dir"])
     seed_everything(int(cfg["seed"]))
 
-    local_rank = int(cfg.get("local_rank", 0))
-    rank, world_size, ddp_enabled = setup_distributed(local_rank)
+    rank, world_size, ddp_enabled, local_rank = setup_distributed(cfg.get("local_rank", None))
     device = resolve_device(local_rank, requested=str(cfg.get("device", "cuda")))
+    print(
+        f"DDP rank={rank}, local_rank={local_rank}, world_size={world_size}, "
+        f"device={device}, current_cuda_device={torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}",
+        flush=True,
+    )
+    dataset = None
+    loader = None
+    sampler = None
+    normal_completed = False
 
     try:
         if is_main_process():
             save_json(cfg, str(cfg["run_dir"] / "config_used.json"))
             build_or_update_h5_if_needed(cfg)
         if ddp_enabled:
-            dist.barrier()
+            ddp_barrier(local_rank)
 
         dataset, loader, sampler = build_loader(cfg, rank, world_size, ddp_enabled)
         model = build_model(cfg, device)
@@ -306,20 +337,32 @@ def train(cfg: Dict) -> None:
         start_epoch = 1
         global_step = 0
         best_loss = float("inf")
+        best_epoch = 0
         if resume_path is not None:
             ckpt = load_checkpoint(resume_path, model=model, optimizer=optimizer, scaler=scaler, map_location="cpu")
             completed_epoch = int(ckpt.get("completed_epoch", ckpt.get("epoch", 0)))
             start_epoch = completed_epoch + 1
             global_step = int(ckpt.get("global_step", 0))
             best_loss = float(ckpt.get("best_loss", float("inf")))
+            best_epoch = int(ckpt.get("best_epoch", ckpt.get("completed_epoch", 0)))
             if is_main_process():
-                print(f"[resume] loaded {resume_path}; start_epoch={start_epoch}, global_step={global_step}, best_loss={best_loss:.6f}")
+                print(
+                    f"[resume] loaded {resume_path}; start_epoch={start_epoch}, "
+                    f"global_step={global_step}, best_epoch={best_epoch}, best_loss={best_loss:.6f}"
+                )
 
-        if ddp_enabled:
-            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, find_unused_parameters=False)
+        if ddp_enabled and device.type == "cuda":
+            model = DDP(model, device_ids=[int(local_rank)], output_device=int(local_rank), find_unused_parameters=False)
+        elif ddp_enabled:
+            model = DDP(model, find_unused_parameters=False)
 
         if is_main_process():
             print(f"Training basins/blocks: dataset_blocks={len(dataset)}, world_size={world_size}, device={device}")
+            if sampler is not None and hasattr(sampler, "raw_counts"):
+                print(f"[Sampler] raw_counts_per_rank={sampler.raw_counts}")
+                print(f"[Sampler] raw_loads_per_rank={sampler.raw_loads}")
+                print(f"[Sampler] yielded_samples_per_rank={len(sampler)}")
+                print(f"[Sampler] drop_last={sampler.drop_last}")
             print("Training is intentionally kept simple; run validation.py or run_eval.sh separately after checkpoints are saved.")
 
         for epoch in range(start_epoch, int(cfg["epochs"]) + 1):
@@ -337,8 +380,14 @@ def train(cfg: Dict) -> None:
                 global_step=global_step,
             )
             if is_main_process():
-                print(f"Epoch {epoch:03d}: loss={epoch_loss:.6f}")
+                print(f"Epoch {epoch:03d} finished: total_loss={epoch_loss:.6f}")
+                if epoch_loss < best_loss:
+                    best_loss = epoch_loss
+                    best_epoch = epoch
                 ckpt_path = cfg["ckpt_dir"] / f"ckpt_epoch{epoch:03d}.pth"
+                latest_path = cfg["ckpt_dir"] / "latest.pth"
+                best_path = cfg["out_dir"] / "best_model.pth"
+                print(f"Saving checkpoint: {ckpt_path}")
                 save_checkpoint(
                     ckpt_path,
                     model=model,
@@ -347,25 +396,49 @@ def train(cfg: Dict) -> None:
                     completed_epoch=epoch,
                     global_step=global_step,
                     best_loss=best_loss,
+                    best_epoch=best_epoch,
                     config=cfg,
                 )
-                shutil.copy2(ckpt_path, cfg["ckpt_dir"] / "latest.pth")
-                if epoch_loss < best_loss:
-                    best_loss = epoch_loss
+                print(f"Saved checkpoint: {ckpt_path}")
+                shutil.copy2(ckpt_path, latest_path)
+                print(f"Updated latest checkpoint: {latest_path}")
+                if best_epoch == epoch:
                     save_checkpoint(
-                        cfg["run_dir"] / "best_model.pth",
+                        best_path,
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
                         completed_epoch=epoch,
                         global_step=global_step,
                         best_loss=best_loss,
+                        best_epoch=best_epoch,
                         config=cfg,
                     )
+                    print(f"Updated best model: {best_path}")
+                print(f"Best epoch: {best_epoch}, best_loss={best_loss:.6f}")
             if ddp_enabled:
-                dist.barrier()
+                ddp_barrier(local_rank)
+        normal_completed = True
     finally:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device if device.type == "cuda" else None)
+            except Exception:
+                pass
+        shutdown_dataloader(loader)
+        try:
+            del loader
+            del dataset
+            del sampler
+        except Exception:
+            pass
+        if ddp_enabled and normal_completed:
+            ddp_barrier(local_rank)
         cleanup_distributed()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if normal_completed and rank == 0:
+            print("Training finished.")
 
 
 def main() -> None:
