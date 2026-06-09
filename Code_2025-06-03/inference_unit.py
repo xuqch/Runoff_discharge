@@ -77,8 +77,9 @@ def load_model(
         dims={"dyn": model_dyn_dim, "stat": model_stat_dim},
         hidden_dim=int(cfg.get("hidden_dim", 128)),
         dropout=float(cfg.get("dropout", 0.4)),
-        precompute_inputs=bool(cfg.get("precompute_inputs", True)),
+        precompute_inputs=bool(cfg.get("precompute_inputs", False)),
         precompute_time_chunk=int(cfg.get("precompute_time_chunk", 0)),
+        precompute_max_positions=int(cfg.get("precompute_max_positions", 1000000)),
     )
     model.use_checkpoint_for_inference = bool(cfg.get("use_checkpoint", False))
     model.load_state_dict(ckpt["model"], strict=True)

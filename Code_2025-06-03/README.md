@@ -46,6 +46,12 @@
 
 06-03 does not run validation automatically inside `train_global.py`. Training only fits the model and saves checkpoints. Run validation separately after training with `validation.py` or `run_eval.sh`.
 
+## EA-LSTM Precompute Inputs
+
+`precompute_inputs` is a speed optimization that precomputes EA-LSTM dynamic input gates. It can increase memory usage substantially because it may create `[P, T, 3H]` tensors. For merged multi-basin or multi-node DDP training on 32GB GPUs, keep it disabled unless the block size is small.
+
+The default is `--no-precompute_inputs`. If `--precompute_inputs` is enabled, `--precompute_max_positions` guards each basin-block by disabling precompute when `P * prefix_len` exceeds the threshold.
+
 Build/train:
 
 ```bash

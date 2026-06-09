@@ -67,8 +67,9 @@ def _load_model(cfg: Dict, ckpt_path: Path, device: torch.device) -> HydroAIBasi
         dims={"dyn": len(cfg["dyn_vars"]), "stat": len(cfg["stat_vars"])},
         hidden_dim=int(saved_cfg.get("hidden_dim", cfg.get("hidden_dim", 128))),
         dropout=float(saved_cfg.get("dropout", cfg.get("dropout", 0.4))),
-        precompute_inputs=bool(saved_cfg.get("precompute_inputs", cfg.get("precompute_inputs", True))),
+        precompute_inputs=bool(saved_cfg.get("precompute_inputs", cfg.get("precompute_inputs", False))),
         precompute_time_chunk=int(saved_cfg.get("precompute_time_chunk", cfg.get("precompute_time_chunk", 0))),
+        precompute_max_positions=int(saved_cfg.get("precompute_max_positions", cfg.get("precompute_max_positions", 1000000))),
     )
     model.load_state_dict(ckpt["model"], strict=True)
     model.to(device)

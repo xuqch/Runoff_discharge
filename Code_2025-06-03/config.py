@@ -80,8 +80,8 @@ def get_args() -> Dict:
     parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--lr_gen", type=float, default=None)
-    parser.add_argument("--lr_vel", type=float, default=None)
+    parser.add_argument('--lr_gen', type=float, default=1e-3)
+    parser.add_argument('--lr_vel', type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.4)
@@ -90,8 +90,18 @@ def get_args() -> Dict:
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--use_checkpoint", action="store_true")
 
-    parser.add_argument("--precompute_inputs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--precompute_inputs", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--precompute_time_chunk", type=int, default=0)
+    parser.add_argument(
+        "--precompute_max_positions",
+        type=int,
+        default=1500000,
+        help=(
+            "Maximum P * prefix_len allowed for EA-LSTM input precomputation. "
+            "If precompute_inputs=True but P*prefix_len exceeds this threshold, "
+            "precompute is disabled for that basin-block. Set <=0 to disable this guard."
+        ),
+    )
 
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--resume_latest", action=argparse.BooleanOptionalAction, default=False)
@@ -141,6 +151,12 @@ def get_args() -> Dict:
     parser.add_argument("--clear_cache", action="store_true")
     parser.add_argument("--empty_cache_interval", type=int, default=20)
     parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--write_last_block_diagnostics", action="store_true", default=False)
+    parser.add_argument("--last_block_diagnostics_file", type=str, default="")
+    parser.add_argument("--debug_loss_threshold", type=float, default=0.0)
+    parser.add_argument("--debug_loss_max_records", type=int, default=2000)
+    parser.add_argument("--debug_loss_print_limit", type=int, default=50)
+    parser.add_argument("--debug_loss_log_file", type=str, default="")
     parser.add_argument("--info", type=str, default=None)
 
     args = parser.parse_args()
@@ -191,7 +207,7 @@ def _bootstrap_run_defaults(cfg: Dict) -> None:
             raw_run_dir = cfg.get("run_dir") or cfg.get("output_dir")
             if raw_run_dir is None:
                 now = datetime.now()
-                run_name = f"run_{now.month:02d}{now.day:02d}_{now.hour + 8:02d}{now.minute:02d}_seed{int(payload['seed'])}"
+                run_name = f"run_{now.month:02d}{now.day:02d}_{now.hour:02d}{now.minute:02d}_seed{int(payload['seed'])}"
                 payload["run_dir"] = str(repo_runs_dir / run_name)
             else:
                 path = Path(str(raw_run_dir)).expanduser()

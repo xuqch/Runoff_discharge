@@ -46,7 +46,7 @@ class EALSTM(nn.Module):
         stat_dim: int,
         hidden_dim: int,
         dropout: float = 0.0,
-        precompute_inputs: bool = True,
+        precompute_inputs: bool = False,
         precompute_time_chunk: int = 0,
     ):
         super().__init__()
@@ -57,8 +57,9 @@ class EALSTM(nn.Module):
         self.cell = EALSTMCell(dyn_dim=dyn_dim, hidden_dim=hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def _precompute_lin_x(self, x_dyn: torch.Tensor) -> Optional[torch.Tensor]:
-        if not self.precompute_inputs:
+    def _precompute_lin_x(self, x_dyn: torch.Tensor, precompute_inputs: Optional[bool] = None) -> Optional[torch.Tensor]:
+        use_precompute = self.precompute_inputs if precompute_inputs is None else bool(precompute_inputs)
+        if not use_precompute:
             return None
 
         chunk = int(self.precompute_time_chunk)
@@ -78,10 +79,11 @@ class EALSTM(nn.Module):
         state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_state: bool = False,
         return_sequence: bool = False,
+        precompute_inputs: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = x_dyn.shape
         i_gate = torch.sigmoid(self.static_gate(x_stat))
-        gates_x_all = self._precompute_lin_x(x_dyn)
+        gates_x_all = self._precompute_lin_x(x_dyn, precompute_inputs=precompute_inputs)
 
         if state is None:
             h = x_dyn.new_zeros(batch_size, self.hidden_dim)
@@ -115,7 +117,7 @@ class PixelWiseRunoffGenerator(nn.Module):
         hidden_dim: int = 128,
         dropout: float = 0.4,
         head_hidden: int = 32,
-        precompute_inputs: bool = True,
+        precompute_inputs: bool = False,
         precompute_time_chunk: int = 0,
     ):
         super().__init__()
@@ -140,6 +142,7 @@ class PixelWiseRunoffGenerator(nn.Module):
         x_stat: torch.Tensor,
         state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_state: bool = False,
+        precompute_inputs: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         h_last, out_state = self.ealstm(
             x_dyn,
@@ -147,6 +150,7 @@ class PixelWiseRunoffGenerator(nn.Module):
             state=state,
             return_state=return_state,
             return_sequence=False,
+            precompute_inputs=precompute_inputs,
         )
         return self.head(h_last), out_state
 
@@ -156,6 +160,7 @@ class PixelWiseRunoffGenerator(nn.Module):
         x_stat: torch.Tensor,
         state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_state: bool = False,
+        precompute_inputs: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         h_seq, out_state = self.ealstm(
             x_dyn,
@@ -163,6 +168,7 @@ class PixelWiseRunoffGenerator(nn.Module):
             state=state,
             return_state=return_state,
             return_sequence=True,
+            precompute_inputs=precompute_inputs,
         )
         return self.head(h_seq), out_state
 
@@ -803,10 +809,13 @@ class HydroAIBasin(nn.Module):
         dims: Dict[str, int],
         hidden_dim: int = 128,
         dropout: float = 0.4,
-        precompute_inputs: bool = True,
+        precompute_inputs: bool = False,
         precompute_time_chunk: int = 0,
+        precompute_max_positions: int = 1000000,
     ):
         super().__init__()
+        self.precompute_max_positions = int(precompute_max_positions)
+        self._precompute_guard_warned = False
         self.generator = PixelWiseRunoffGenerator(
             dyn_dim=dims["dyn"],
             stat_dim=dims["stat"],
@@ -836,11 +845,38 @@ class HydroAIBasin(nn.Module):
     def apply_fraction_coefficient(runoff: torch.Tensor, fraction: torch.Tensor) -> torch.Tensor:
         return runoff * torch.clamp(fraction.reshape(-1), min=0.0)[:, None]
 
-    def _generator_forward_tensor(self, x_dyn: torch.Tensor, x_stat: torch.Tensor) -> torch.Tensor:
-        return self.generator(x_dyn, x_stat, return_state=False)[0]
+    def _should_precompute_inputs(self, x_dyn: torch.Tensor) -> bool:
+        use_precompute = bool(self.generator.ealstm.precompute_inputs)
+        if not use_precompute:
+            return False
 
-    def _generator_forward_sequence_tensor(self, x_dyn: torch.Tensor, x_stat: torch.Tensor) -> torch.Tensor:
-        return self.generator.forward_sequence(x_dyn, x_stat, return_state=False)[0]
+        limit = int(getattr(self, "precompute_max_positions", 0) or 0)
+        p_count = int(x_dyn.shape[0])
+        prefix_len = int(x_dyn.shape[1])
+        positions = p_count * prefix_len
+        if limit > 0 and positions > limit:
+            if not self._precompute_guard_warned:
+                try:
+                    import torch.distributed as dist
+
+                    should_print = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+                except Exception:
+                    should_print = True
+                if should_print:
+                    print(
+                        "[PrecomputeGuard] disabled precompute_inputs for block "
+                        f"with P={p_count}, prefix_len={prefix_len}, positions={positions}, limit={limit}",
+                        flush=True,
+                    )
+                self._precompute_guard_warned = True
+            return False
+        return True
+
+    def _generator_forward_tensor(self, x_dyn: torch.Tensor, x_stat: torch.Tensor, precompute_inputs: Optional[bool] = None) -> torch.Tensor:
+        return self.generator(x_dyn, x_stat, return_state=False, precompute_inputs=precompute_inputs)[0]
+
+    def _generator_forward_sequence_tensor(self, x_dyn: torch.Tensor, x_stat: torch.Tensor, precompute_inputs: Optional[bool] = None) -> torch.Tensor:
+        return self.generator.forward_sequence(x_dyn, x_stat, return_state=False, precompute_inputs=precompute_inputs)[0]
 
     def generate_runoff(
         self,
@@ -854,6 +890,7 @@ class HydroAIBasin(nn.Module):
         total = x_dyn.shape[0]
         chunk_size = total if not generator_chunk_size or generator_chunk_size <= 0 else int(generator_chunk_size)
         chunk_outputs: List[torch.Tensor] = []
+        use_precompute = self._should_precompute_inputs(x_dyn)
 
         for start in range(0, total, chunk_size):
             end = min(total, start + chunk_size)
@@ -862,13 +899,13 @@ class HydroAIBasin(nn.Module):
 
             if self.training and use_checkpoint:
                 runoff_chunk = checkpoint(
-                    self._generator_forward_tensor,
+                    lambda dyn, stat: self._generator_forward_tensor(dyn, stat, precompute_inputs=use_precompute),
                     x_dyn_chunk,
                     x_stat_chunk,
                     use_reentrant=False,
                 )
             else:
-                runoff_chunk = self._generator_forward_tensor(x_dyn_chunk, x_stat_chunk)
+                runoff_chunk = self._generator_forward_tensor(x_dyn_chunk, x_stat_chunk, precompute_inputs=use_precompute)
 
             chunk_outputs.append(runoff_chunk.squeeze(-1))
             del x_dyn_chunk, x_stat_chunk, runoff_chunk
@@ -890,6 +927,7 @@ class HydroAIBasin(nn.Module):
         total = x_dyn.shape[0]
         chunk_size = total if not generator_chunk_size or generator_chunk_size <= 0 else int(generator_chunk_size)
         chunk_outputs: List[torch.Tensor] = []
+        use_precompute = self._should_precompute_inputs(x_dyn)
 
         for start in range(0, total, chunk_size):
             end = min(total, start + chunk_size)
@@ -898,13 +936,13 @@ class HydroAIBasin(nn.Module):
 
             if self.training and use_checkpoint:
                 runoff_chunk = checkpoint(
-                    self._generator_forward_sequence_tensor,
+                    lambda dyn, stat: self._generator_forward_sequence_tensor(dyn, stat, precompute_inputs=use_precompute),
                     x_dyn_chunk,
                     x_stat_chunk,
                     use_reentrant=False,
                 )
             else:
-                runoff_chunk = self._generator_forward_sequence_tensor(x_dyn_chunk, x_stat_chunk)
+                runoff_chunk = self._generator_forward_sequence_tensor(x_dyn_chunk, x_stat_chunk, precompute_inputs=use_precompute)
 
             chunk_outputs.append(runoff_chunk.squeeze(-1))
             del x_dyn_chunk, x_stat_chunk, runoff_chunk

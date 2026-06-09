@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import csv
+import math
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import h5py
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -187,6 +191,7 @@ def build_model(cfg: Dict, device: torch.device) -> HydroAIBasinPhaseH:
         dropout=float(cfg["dropout"]),
         precompute_inputs=bool(cfg["precompute_inputs"]),
         precompute_time_chunk=int(cfg["precompute_time_chunk"]),
+        precompute_max_positions=int(cfg.get("precompute_max_positions", 1000000)),
     )
     return model.to(device)
 
@@ -200,6 +205,399 @@ def build_optimizer(cfg: Dict, model: torch.nn.Module) -> torch.optim.Optimizer:
         ],
         weight_decay=float(cfg.get("weight_decay", 0.0)),
     )
+
+
+def scheduled_lrs_for_epoch(cfg: Dict, current_epoch: int) -> tuple[float, float]:
+    total_epochs = int(cfg["epochs"])
+    base_lr_gen = float(cfg["lr_gen"])
+    base_lr_vel = float(cfg["lr_vel"])
+
+    if total_epochs <= 50:
+        if current_epoch >= 21:
+            return 1e-4, 1e-5
+        if current_epoch >= 11:
+            return 5e-4, 5e-5
+        return base_lr_gen, base_lr_vel
+
+    m1 = int(math.floor(total_epochs * 0.40)) + 1
+    m2 = int(math.floor(total_epochs * 0.70)) + 1
+    m3 = int(math.floor(total_epochs * 0.90)) + 1
+    if current_epoch >= m3:
+        scale = 0.05
+    elif current_epoch >= m2:
+        scale = 0.1
+    elif current_epoch >= m1:
+        scale = 0.5
+    else:
+        scale = 1.0
+    return base_lr_gen * scale, base_lr_vel * scale
+
+
+def _safe_float(value, default=""):
+    if value is None:
+        return default
+    try:
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            value = value.detach().float().mean().cpu().item()
+        return float(value)
+    except Exception:
+        return default
+
+
+def _first_metric(metrics: Dict, keys: tuple[str, ...], default=""):
+    for key in keys:
+        if key in metrics:
+            return _safe_float(metrics.get(key), default=default)
+    return default
+
+
+def _aux_mean(aux, keys: tuple[str, ...]):
+    if not isinstance(aux, dict):
+        return ""
+    for key in keys:
+        if key in aux:
+            return _safe_float(aux[key], default="")
+    return ""
+
+
+def _path_with_rank(path: Path, rank: int) -> Path:
+    suffix = path.suffix
+    if suffix:
+        return path.with_name(f"{path.stem}.rank{rank}{suffix}")
+    return path.with_name(f"{path.name}.rank{rank}.csv")
+
+
+def write_last_block_diagnostics(dataset, out_csv_path: str | Path) -> None:
+    out_path = Path(out_csv_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    samples = getattr(dataset, "samples", [])
+    last_by_basin: Dict[str, Dict] = {}
+    for sample in samples:
+        basin_id = str(sample.get("basin_id", ""))
+        if not basin_id:
+            continue
+        previous = last_by_basin.get(basin_id)
+        key = (int(sample.get("block_start", -1)), int(sample.get("block_end", -1)))
+        previous_key = (
+            int(previous.get("block_start", -1)),
+            int(previous.get("block_end", -1)),
+        ) if previous else (-1, -1)
+        if previous is None or key > previous_key:
+            last_by_basin[basin_id] = sample
+
+    fields = [
+        "basin_id",
+        "sample_id",
+        "block_start",
+        "block_end",
+        "last_time_len",
+        "valid_target_len",
+        "timeindex_start",
+        "timeindex_end",
+        "h5_path",
+    ]
+    rows: List[Dict] = []
+    for basin_id, sample in sorted(last_by_basin.items()):
+        block_start = int(sample.get("block_start", 0))
+        block_end = int(sample.get("block_end", 0))
+        h5_path = Path(sample.get("h5_file", ""))
+        timeindex_start = ""
+        timeindex_end = ""
+        valid_target_len = sample.get("valid_target_count", "")
+        try:
+            with h5py.File(h5_path, "r") as f:
+                target_idx_block = f["target_idx"][block_start:block_end]
+                if len(target_idx_block) > 0:
+                    timeindex_start = int(target_idx_block[0])
+                    timeindex_end = int(target_idx_block[-1])
+                if valid_target_len == "" or valid_target_len is None:
+                    target_valid = f["target_valid"][block_start:block_end]
+                    valid_target_len = int(np.asarray(target_valid).astype(bool).sum())
+        except Exception as exc:
+            print(f"[last-block diagnostics] warning: failed to inspect {h5_path}: {exc}")
+            valid_target_len = "" if valid_target_len is None else valid_target_len
+
+        rows.append(
+            {
+                "basin_id": basin_id,
+                "sample_id": sample.get("sample_id", f"{basin_id}:{block_start}:{block_end}"),
+                "block_start": block_start,
+                "block_end": block_end,
+                "last_time_len": block_end - block_start,
+                "valid_target_len": valid_target_len,
+                "timeindex_start": timeindex_start,
+                "timeindex_end": timeindex_end,
+                "h5_path": str(h5_path),
+            }
+        )
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    if not rows:
+        print(f"[last-block diagnostics] warning: no records written to {out_path}")
+        return
+
+    last_lens = np.asarray([int(row["last_time_len"]) for row in rows], dtype=np.float64)
+    valid_lens = np.asarray([float(row["valid_target_len"]) for row in rows if row["valid_target_len"] != ""], dtype=np.float64)
+    print(f"[last-block diagnostics] wrote {out_path}")
+    print(
+        "[last-block diagnostics] "
+        f"basins={len(rows)} last_time_len min/median/max="
+        f"{int(np.min(last_lens))}/{float(np.median(last_lens)):.1f}/{int(np.max(last_lens))}"
+    )
+    if valid_lens.size > 0:
+        below_365 = int(np.sum(valid_lens < 365))
+        print(
+            "[last-block diagnostics] "
+            f"valid_target_len min/median/max={int(np.min(valid_lens))}/{float(np.median(valid_lens)):.1f}/{int(np.max(valid_lens))}"
+        )
+        print(f"[last-block diagnostics] basins with valid_target_len < 365: {below_365}")
+
+
+class HighLossLogger:
+    fields = [
+        "rank",
+        "epoch",
+        "step_in_epoch",
+        "global_step",
+        "loss_total_step",
+        "loss_data_step",
+        "loss_q_step",
+        "loss_mb_step",
+        "loss_route_step",
+        "basin_id",
+        "sample_id",
+        "block_start",
+        "block_end",
+        "block_len",
+        "valid_target_count",
+        "timeindex_start",
+        "timeindex_end",
+        "q_std_loss",
+        "obs_mean",
+        "obs_max",
+        "obs_p90",
+        "sim_mean",
+        "sim_max",
+        "sim_min",
+        "rmse",
+        "norm_rmse",
+        "bias",
+        "rel_bias",
+        "lag_mean",
+        "v_mean",
+    ]
+
+    def __init__(self, cfg: Dict, rank: int) -> None:
+        self.threshold = float(cfg.get("debug_loss_threshold", 0.0))
+        self.max_records = int(cfg.get("debug_loss_max_records", 2000))
+        self.print_limit = int(cfg.get("debug_loss_print_limit", 50))
+        self.rank = int(rank)
+        self.records_written = 0
+        self.printed = 0
+        self.warned_missing_q_pred = False
+        self.warned_error = False
+        raw_path = str(cfg.get("debug_loss_log_file", "") or "")
+        self.path = _path_with_rank(Path(raw_path), self.rank) if raw_path else Path(cfg["out_dir"]) / f"high_loss_rank{self.rank}.csv"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def enabled(self) -> bool:
+        return self.threshold > 0 and self.records_written < self.max_records
+
+    def _append_row(self, row: Dict) -> None:
+        write_header = (not self.path.exists()) or self.path.stat().st_size == 0
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        self.records_written += 1
+
+    def _q_pred_list(self, outputs: Dict, basin_count: int):
+        q_pred = outputs.get("q_pred", outputs.get("q_pred_list"))
+        if q_pred is None:
+            if not self.warned_missing_q_pred:
+                print("[HIGH_LOSS] warning: outputs do not contain q_pred; prediction stats will be empty.")
+                self.warned_missing_q_pred = True
+            return [None] * basin_count
+        if isinstance(q_pred, (list, tuple)):
+            return list(q_pred)
+        if torch.is_tensor(q_pred) and basin_count == 1:
+            return [q_pred]
+        return [None] * basin_count
+
+    def maybe_log(
+        self,
+        *,
+        epoch: int,
+        step_in_epoch: int,
+        global_step: int,
+        loss_value: float,
+        data_loss,
+        metrics: Dict,
+        route_loss,
+        route_metrics: Dict,
+        outputs: Dict,
+        basin_meta: List[Dict],
+    ) -> None:
+        if loss_value <= self.threshold or not self.enabled():
+            return
+        try:
+            with torch.no_grad():
+                q_preds = self._q_pred_list(outputs, len(basin_meta))
+                route_aux_list = outputs.get("route_aux", [])
+                for basin_index, meta in enumerate(basin_meta):
+                    if self.records_written >= self.max_records:
+                        break
+                    q_pred = q_preds[basin_index] if basin_index < len(q_preds) else None
+                    aux = route_aux_list[basin_index] if isinstance(route_aux_list, (list, tuple)) and basin_index < len(route_aux_list) else None
+                    row = self._build_row(
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch,
+                        global_step=global_step,
+                        loss_value=loss_value,
+                        data_loss=data_loss,
+                        metrics=metrics,
+                        route_loss=route_loss,
+                        route_metrics=route_metrics,
+                        meta=meta,
+                        q_pred=q_pred,
+                        aux=aux,
+                    )
+                    self._append_row(row)
+                    if self.printed < self.print_limit:
+                        print(
+                            "[HIGH_LOSS] "
+                            f"rank={self.rank} epoch={epoch} step={step_in_epoch} loss={loss_value:.3f} "
+                            f"basin={row['basin_id']} block={row['block_start']}:{row['block_end']} "
+                            f"valid={row['valid_target_count']} q_std_loss={row['q_std_loss']} rmse={row['rmse']}",
+                            flush=True,
+                        )
+                        self.printed += 1
+        except Exception as exc:
+            if not self.warned_error:
+                print(f"[HIGH_LOSS] warning: diagnostics failed and training will continue: {exc}")
+                self.warned_error = True
+
+    def _build_row(self, *, epoch, step_in_epoch, global_step, loss_value, data_loss, metrics, route_loss, route_metrics, meta, q_pred, aux) -> Dict:
+        block_start = int(meta.get("block_start", 0))
+        block_end = int(meta.get("block_end", 0))
+        q_std_value = self._meta_scalar(meta, "q_std_loss")
+        timeindex_start, timeindex_end = self._timeindex_bounds(meta)
+        stats = self._flow_stats(meta, q_pred, q_std_value)
+        return {
+            "rank": self.rank,
+            "epoch": int(epoch),
+            "step_in_epoch": int(step_in_epoch),
+            "global_step": int(global_step),
+            "loss_total_step": float(loss_value),
+            "loss_data_step": _safe_float(data_loss, default=""),
+            "loss_q_step": _first_metric(metrics, ("loss_q", "q_loss"), default=""),
+            "loss_mb_step": _first_metric(metrics, ("loss_mb", "mb"), default=""),
+            "loss_route_step": _first_metric(route_metrics, ("loss_route_total", "route_loss"), default=_safe_float(route_loss, default="")),
+            "basin_id": meta.get("basin_id", ""),
+            "sample_id": meta.get("sample_id", f"{meta.get('basin_id', '')}:{block_start}:{block_end}"),
+            "block_start": block_start,
+            "block_end": block_end,
+            "block_len": block_end - block_start,
+            **stats,
+            "valid_target_count": int(meta.get("valid_target_count", stats.get("valid_target_count", 0))),
+            "timeindex_start": timeindex_start,
+            "timeindex_end": timeindex_end,
+            "q_std_loss": q_std_value,
+            "lag_mean": _aux_mean(aux, ("lag", "lag_mean", "lag_days", "total_lag_days", "channel_lag_days", "lag_len")),
+            "v_mean": _aux_mean(aux, ("v_mean", "velocity_mean", "mean_velocity", "velocity_mps")),
+        }
+
+    @staticmethod
+    def _meta_scalar(meta: Dict, key: str):
+        if key not in meta:
+            return ""
+        value = meta[key]
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return ""
+            return float(value.detach().reshape(-1)[0].cpu())
+        return _safe_float(value, default="")
+
+    @staticmethod
+    def _timeindex_bounds(meta: Dict) -> tuple[object, object]:
+        # target_idx is local to the sliced sequence; target_timeindex preserves the original H5 time index.
+        idx = meta.get("target_timeindex", meta.get("target_idx"))
+        if torch.is_tensor(idx):
+            if idx.numel() == 0:
+                return "", ""
+            flat = idx.detach().reshape(-1).cpu()
+            return int(flat[0]), int(flat[-1])
+        try:
+            arr = np.asarray(idx).reshape(-1)
+            if arr.size == 0:
+                return "", ""
+            return int(arr[0]), int(arr[-1])
+        except Exception:
+            return "", ""
+
+    @staticmethod
+    def _flow_stats(meta: Dict, q_pred, q_std_value) -> Dict:
+        keys = [
+            "valid_target_count",
+            "obs_mean",
+            "obs_max",
+            "obs_p90",
+            "sim_mean",
+            "sim_max",
+            "sim_min",
+            "rmse",
+            "norm_rmse",
+            "bias",
+            "rel_bias",
+        ]
+        empty = {key: "" for key in keys}
+        if q_pred is None or "q_true" not in meta or "q_valid" not in meta:
+            return empty
+        q_valid = meta["q_valid"].detach().reshape(-1).bool().cpu()
+        q_true = meta["q_true"].detach().reshape(-1).float().cpu()
+        q_pred_flat = q_pred.detach().reshape(-1).float().cpu()
+        n = min(q_valid.numel(), q_true.numel(), q_pred_flat.numel())
+        if n <= 0:
+            return empty
+        q_valid = q_valid[:n]
+        q_true = q_true[:n]
+        q_pred_flat = q_pred_flat[:n]
+        valid_count = int(q_valid.sum().item())
+        empty["valid_target_count"] = valid_count
+        if valid_count == 0:
+            return empty
+        q_true_valid = q_true[q_valid]
+        q_pred_valid = q_pred_flat[q_valid]
+        diff = q_pred_valid - q_true_valid
+        rmse = torch.sqrt(torch.mean(diff ** 2))
+        bias = torch.mean(diff)
+        obs_mean = torch.mean(q_true_valid)
+        try:
+            obs_p90 = torch.quantile(q_true_valid.float(), 0.9)
+        except Exception:
+            obs_p90 = None
+        q_std = q_std_value if isinstance(q_std_value, (int, float)) else 0.0
+        norm_rmse = rmse / (float(q_std) + 0.1)
+        return {
+            "valid_target_count": valid_count,
+            "obs_mean": float(obs_mean.cpu()),
+            "obs_max": float(torch.max(q_true_valid).cpu()),
+            "obs_p90": "" if obs_p90 is None else float(obs_p90.cpu()),
+            "sim_mean": float(torch.mean(q_pred_valid).cpu()),
+            "sim_max": float(torch.max(q_pred_valid).cpu()),
+            "sim_min": float(torch.min(q_pred_valid).cpu()),
+            "rmse": float(rmse.cpu()),
+            "norm_rmse": float(norm_rmse.cpu()),
+            "bias": float(bias.cpu()),
+            "rel_bias": float((bias / (torch.abs(obs_mean) + 1e-6)).cpu()),
+        }
 
 
 def reduce_epoch_stats(loss_sum: float, step_count: int, device: torch.device) -> tuple[float, int]:
@@ -240,6 +638,7 @@ def train_one_epoch(
     loader: DataLoader,
     device: torch.device,
     global_step: int,
+    high_loss_logger: HighLossLogger | None = None,
 ) -> tuple[float, int]:
     model.train()
     route_w = route_weights(cfg)
@@ -291,6 +690,19 @@ def train_one_epoch(
         global_step += 1
         step_count += 1
         loss_value = float(loss.detach().cpu())
+        if high_loss_logger is not None:
+            high_loss_logger.maybe_log(
+                epoch=epoch,
+                step_in_epoch=step_in_epoch,
+                global_step=global_step,
+                loss_value=loss_value,
+                data_loss=data_loss,
+                metrics=metrics,
+                route_loss=route_loss,
+                route_metrics=route_metrics,
+                outputs=outputs,
+                basin_meta=basin_meta,
+            )
         loss_sum += loss_value
         if is_main_process() and step_in_epoch % int(cfg.get("log_interval", 10)) == 0:
             progress.set_postfix(_progress_postfix(loss_value, metrics, route_metrics, outputs))
@@ -327,8 +739,15 @@ def train(cfg: Dict) -> None:
             ddp_barrier(local_rank)
 
         dataset, loader, sampler = build_loader(cfg, rank, world_size, ddp_enabled)
+        if is_main_process() and bool(cfg.get("write_last_block_diagnostics", False)):
+            diag_path = Path(cfg.get("last_block_diagnostics_file") or cfg["out_dir"] / "last_block_diagnostics.csv")
+            write_last_block_diagnostics(dataset, diag_path)
+        if ddp_enabled:
+            ddp_barrier(local_rank)
+
         model = build_model(cfg, device)
         optimizer = build_optimizer(cfg, model)
+        high_loss_logger = HighLossLogger(cfg, rank) if float(cfg.get("debug_loss_threshold", 0.0)) > 0 else None
         # scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.get("use_amp", False)) and device.type == "cuda")
         scaler = torch.amp.GradScaler( "cuda",enabled=bool(cfg.get("use_amp", False)) and device.type == "cuda",)
         criterion = build_criterion(cfg)
@@ -368,6 +787,15 @@ def train(cfg: Dict) -> None:
         for epoch in range(start_epoch, int(cfg["epochs"]) + 1):
             if sampler is not None and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
+            lr_gen_now, lr_vel_now = scheduled_lrs_for_epoch(cfg, epoch)
+            optimizer.param_groups[0]["lr"] = lr_gen_now
+            optimizer.param_groups[1]["lr"] = lr_vel_now
+            if is_main_process():
+                print(
+                    f"[lr update] epoch={epoch} "
+                    f"lr_gen={optimizer.param_groups[0]['lr']:.2e} "
+                    f"lr_vel={optimizer.param_groups[1]['lr']:.2e}"
+                )
             epoch_loss, global_step = train_one_epoch(
                 cfg=cfg,
                 epoch=epoch,
@@ -378,6 +806,7 @@ def train(cfg: Dict) -> None:
                 loader=loader,
                 device=device,
                 global_step=global_step,
+                high_loss_logger=high_loss_logger,
             )
             if is_main_process():
                 print(f"Epoch {epoch:03d} finished: total_loss={epoch_loss:.6f}")

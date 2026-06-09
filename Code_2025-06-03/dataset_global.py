@@ -198,6 +198,7 @@ class PerBasinBlockH5Dataset(Dataset):
             "x_dyn_base": torch.from_numpy(x_dyn_base),
             "x_stat_base": torch.from_numpy(x_stat_base),
             "target_idx": torch.from_numpy(local_target_idx.astype(np.int64)),
+            "target_timeindex": torch.from_numpy(target_idx_block.astype(np.int64)),
             "q_true": torch.from_numpy(q_true),
             "q_valid": torch.from_numpy(q_valid.astype(np.float32)),
             "q_std_loss": torch.from_numpy(q_std_loss),
