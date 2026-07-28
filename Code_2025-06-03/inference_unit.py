@@ -176,6 +176,7 @@ def predict_grid_batch(
     x_dyn_year_batch: np.ndarray,
     x_stat_batch: np.ndarray,
     seq_len: int,
+    generator_chunk_size: Optional[int] = None,
 ) -> np.ndarray:
     import torch
 
@@ -187,11 +188,13 @@ def predict_grid_batch(
     x_stat_flat = np.repeat(np.asarray(x_stat_batch, dtype=np.float32), repeats=n_windows, axis=0).astype(np.float32, copy=False)
 
     try:
-        with torch.no_grad():
+        # Inference mode has lower autograd bookkeeping overhead than no_grad.
+        with torch.inference_mode():
             runoff = model(
                 x_dyn_flat=torch.from_numpy(x_dyn_flat),
                 x_stat_flat=torch.from_numpy(x_stat_flat),
                 basin_meta=None,
+                generator_chunk_size=generator_chunk_size,
                 is_basin=False,
             )
     except RuntimeError as exc:

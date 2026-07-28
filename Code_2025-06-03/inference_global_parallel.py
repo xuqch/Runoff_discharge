@@ -210,6 +210,7 @@ def worker_predict_grid_shard(
     worker_id: int,
     part_path: str,
     grid_batch_size: int,
+    generator_chunk_size: int | None,
 ) -> Dict[str, object]:
     import torch
     from utils import load_scalers
@@ -254,6 +255,7 @@ def worker_predict_grid_shard(
             x_dyn_year_batch=x_dyn_year_shard[batch_start:batch_end],
             x_stat_batch=x_stat_shard[batch_start:batch_end],
             seq_len=seq_len,
+            generator_chunk_size=generator_chunk_size,
         )
         runoff_shard[:, batch_start:batch_end] = preds.T
 
@@ -291,6 +293,8 @@ def infer_multi_cuda(
     infer_start_year: Optional[int] = None,
     infer_end_year: Optional[int] = None,
     grid_batch_size: int = 1,
+    generator_chunk_size: int | None = None,
+    inference_compression_level: int = 1,
     inference_tmp_dir: str | Path | None = None,
     keep_inference_parts: bool = False,
 ) -> None:
@@ -299,6 +303,8 @@ def infer_multi_cuda(
     area_dir = Path(area_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if not 0 <= int(inference_compression_level) <= 9:
+        raise ValueError("inference_compression_level must be between 0 and 9.")
     parts_dir = Path(inference_tmp_dir) if inference_tmp_dir is not None else (out_dir / "parts")
     parts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -414,6 +420,7 @@ def infer_multi_cuda(
                         worker_id=worker_id,
                         part_path=part_path,
                         grid_batch_size=int(grid_batch_size),
+                        generator_chunk_size=generator_chunk_size,
                     )
                 )
 
@@ -465,14 +472,11 @@ def infer_multi_cuda(
                 "grid_batch_size": int(grid_batch_size),
             },
         )
-        encoding = {
-            "runoff": {
-                "zlib": True,
-                "complevel": 4,
-                "dtype": "float32",
-                "_FillValue": np.float32(np.nan),
-            }
-        }
+        encoding = {"runoff": {"dtype": "float32", "_FillValue": np.float32(np.nan)}}
+        if int(inference_compression_level) > 0:
+            encoding["runoff"].update(
+                {"zlib": True, "complevel": int(inference_compression_level)}
+            )
         out_path = out_dir / f"Area_{year}.nc"
         out.to_netcdf(out_path, encoding=encoding)
         print(f"[inference] saved yearly output: {out_path}")
@@ -499,6 +503,8 @@ def interfere(cfg: Dict, cuda_devices: Sequence[str]) -> None:
         infer_start_year=cfg.get("infer_start_year"),
         infer_end_year=cfg.get("infer_end_year"),
         grid_batch_size=int(cfg.get("grid_batch_size", 1)),
+        generator_chunk_size=int(cfg.get("generator_chunk_size", 0)) or None,
+        inference_compression_level=int(cfg.get("inference_compression_level", 1)),
         inference_tmp_dir=inference_tmp_dir,
         keep_inference_parts=bool(cfg.get("keep_inference_parts", False)),
     )

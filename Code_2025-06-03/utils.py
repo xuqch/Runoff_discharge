@@ -499,6 +499,38 @@ def build_latitude_vector_from_ds(
     return lat2d.reshape(-1)[mask_flat].astype(np.float32)
 
 
+def extract_rectilinear_grid_metadata(
+        ds,
+        mask_var: str = "elv",
+        lat_name: str = None,
+        lon_name: str = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(lat, lon, valid_mask)`` for a rectilinear basin grid.
+
+    The flattened valid cells are deliberately in C order so that they align
+    with the point dimension produced by :func:`load_nc_vars` and validation
+    can restore gridded outputs from the original basin NetCDF file.
+    """
+    latn, lonn = _infer_lat_lon_names(ds, lat_name=lat_name, lon_name=lon_name)
+    lat = np.asarray(ds[latn].values, dtype=np.float64)
+    lon = np.asarray(ds[lonn].values, dtype=np.float64)
+    valid_mask = ~np.isnan(np.asarray(ds[mask_var].values))
+
+    if valid_mask.ndim != 2:
+        raise ValueError(f"{mask_var} must be a 2D spatial mask, got shape={valid_mask.shape}")
+    if lat.ndim != 1 or lon.ndim != 1:
+        raise ValueError(
+            "Only rectilinear 1D latitude/longitude coordinates are supported for "
+            f"(time, lat, lon) validation output; got lat.ndim={lat.ndim}, lon.ndim={lon.ndim}."
+        )
+    if valid_mask.shape != (lat.size, lon.size):
+        raise ValueError(
+            "Spatial mask shape does not match latitude/longitude coordinates: "
+            f"mask={valid_mask.shape}, lat={lat.size}, lon={lon.size}"
+        )
+    return lat.astype(np.float32), lon.astype(np.float32), valid_mask.astype(bool)
+
+
 def _solar_declination_rad(day_of_year: np.ndarray) -> np.ndarray:
     return np.deg2rad(23.45) * np.sin(2.0 * np.pi * (284.0 + day_of_year) / 365.0)
 

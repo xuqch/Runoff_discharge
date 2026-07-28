@@ -244,9 +244,11 @@ def build_criterion(cfg: Dict):
         soft_hist_sigma_scale=float(cfg["mfm_soft_hist_sigma_scale"]),
         w_peak=float(cfg.get("w_peak", 0.0)),
         peak_quantile=float(cfg.get("peak_quantile", 0.9)),
-        peak_weight=float(cfg.get("peak_weight", 2.0)),
-        peak_eps=float(cfg.get("peak_eps", 0.1)),
-        peak_use_relative_error=bool(cfg.get("peak_use_relative_error", True)),
+        peak_weight=float(cfg.get("peak_weight", 1.0)),
+        peak_eps=float(cfg.get("peak_eps", 0.5)),
+        peak_min_valid_count=int(cfg.get("peak_min_valid_count", 100)),
+        peak_min_peak_count=int(cfg.get("peak_min_peak_count", 10)),
+        peak_huber_beta=float(cfg.get("peak_huber_beta", 1.0)),
     )
 
 

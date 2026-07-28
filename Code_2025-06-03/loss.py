@@ -14,6 +14,13 @@ def _safe_mean_abs(x: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.where(denom > eps, denom, alt + eps)
 
 
+def _connected_zero_from_q_pred(q_pred_list: List[torch.Tensor], fallback_device) -> torch.Tensor:
+    for q_pred in q_pred_list:
+        if torch.is_tensor(q_pred):
+            return q_pred.reshape(-1).sum() * 0.0
+    return torch.zeros((), device=fallback_device, requires_grad=True)
+
+
 class MFMLoss(nn.Module):
     def __init__(
         self,
@@ -153,7 +160,7 @@ class MFMLoss(nn.Module):
             losses.append(1.0 - mfm)
 
         if not losses:
-            return torch.zeros((), device=q_mean_global.device, requires_grad=True)
+            return _connected_zero_from_q_pred(q_pred_list, q_mean_global.device)
         return torch.stack(losses).mean()
 
 
@@ -183,39 +190,56 @@ class NSELoss(nn.Module):
             sim = q_pred.reshape(-1)[q_valid]
 
             q90 = torch.quantile(obs.detach(), 0.90)
-            k = 8
-            alpha = 2
+            k = 5
+            alpha = 1
             scaled = (obs.detach() - q90) / (q_std_loss + self.eps)
             high_weight = 1.0 + alpha * torch.sigmoid(k * scaled)
             losses.append(torch.mean(high_weight * ((sim - obs) / (q_std_loss + self.eps)) ** 2))
             del q_valid, q_std_loss, q90, high_weight, obs, sim
         if not losses:
-            return torch.zeros((), device=q_mean_global.device, requires_grad=True)
+            return _connected_zero_from_q_pred(q_pred_list, q_mean_global.device)
         return torch.stack(losses).mean()
 
 
 class PeakFlowLoss(nn.Module):
-    """Extra loss term that focuses on high-flow timesteps only."""
+    """Bounded high-flow loss using basin-scale normalization and Smooth L1."""
 
     def __init__(
         self,
         quantile: float = 0.9,
-        weight: float = 2.0,
-        eps: float = 0.1,
-        use_relative_error: bool = True,
+        weight: float = 1.0,
+        eps: float = 0.5,
+        min_valid_count: int = 100,
+        min_peak_count: int = 10,
+        huber_beta: float = 1.0,
     ):
         super().__init__()
         self.quantile = float(quantile)
         self.weight = float(weight)
         self.eps = float(eps)
-        self.use_relative_error = bool(use_relative_error)
+        self.min_valid_count = max(1, int(min_valid_count))
+        self.min_peak_count = max(1, int(min_peak_count))
+        self.huber_beta = float(huber_beta)
+
+    def _scale(self, obs: torch.Tensor, meta: Dict, device: torch.device) -> torch.Tensor:
+        obs_scale = torch.quantile(torch.abs(obs.detach()), 0.50).clamp_min(self.eps)
+        scale = obs_scale
+        q_std_value = meta.get("q_std_loss")
+        if q_std_value is not None:
+            q_std_tensor = torch.as_tensor(q_std_value, device=device, dtype=obs.dtype).reshape(-1)
+            q_std_tensor = q_std_tensor[torch.isfinite(q_std_tensor)]
+            if q_std_tensor.numel() > 0:
+                q_std_scalar = torch.abs(q_std_tensor[0])
+                if float(q_std_scalar.detach().cpu()) > self.eps:
+                    scale = torch.maximum(obs_scale, q_std_scalar)
+        return scale.clamp_min(self.eps)
 
     def forward(self, q_pred_list: List[torch.Tensor], basin_meta: List[Dict]) -> torch.Tensor:
         losses: List[torch.Tensor] = []
         for q_pred, meta in zip(q_pred_list, basin_meta):
             device = q_pred.device
             q_valid = meta["q_valid"].to(device, non_blocking=True).reshape(-1).bool()
-            if int(q_valid.sum().item()) < 3:
+            if int(q_valid.sum().item()) < self.min_valid_count:
                 continue
 
             obs = meta["q_true"].to(device, non_blocking=True).reshape(-1)[q_valid]
@@ -223,26 +247,31 @@ class PeakFlowLoss(nn.Module):
             finite_mask = torch.isfinite(obs) & torch.isfinite(sim)
             obs = obs[finite_mask]
             sim = sim[finite_mask]
-            if obs.numel() < 3:
+            if obs.numel() < self.min_valid_count:
                 continue
 
             threshold = torch.quantile(obs.detach(), self.quantile)
             peak_mask = obs.detach() >= threshold
-            if int(peak_mask.sum().item()) == 0:
+            if int(peak_mask.sum().item()) < self.min_peak_count:
                 continue
 
             obs_peak = obs[peak_mask]
             sim_peak = sim[peak_mask]
-            if self.use_relative_error:
-                error = ((sim_peak - obs_peak) / (torch.abs(obs_peak) + self.eps)) ** 2
-            else:
-                error = (sim_peak - obs_peak) ** 2
-
-            losses.append(self.weight * error.mean())
+            scale = self._scale(obs, meta, device)
+            normalized_error = (sim_peak - obs_peak) / scale
+            huber = F.smooth_l1_loss(
+                normalized_error,
+                torch.zeros_like(normalized_error),
+                beta=self.huber_beta,
+                reduction="none",
+            )
+            bounded_error = -torch.expm1(-huber)
+            bounded_error = bounded_error.clamp(max=1.0 - torch.finfo(bounded_error.dtype).eps)
+            losses.append(self.weight * bounded_error.mean())
 
         if not losses:
             device = q_pred_list[0].device if q_pred_list else "cpu"
-            return torch.zeros((), device=device, requires_grad=True)
+            return _connected_zero_from_q_pred(q_pred_list, device)
         return torch.stack(losses).mean()
 
 
@@ -549,9 +578,11 @@ class HydroMFMLoss(_BaseHydroLoss):
         budyko_min_days_per_year: int = 300,
         w_peak: float = 0.0,
         peak_quantile: float = 0.9,
-        peak_weight: float = 2.0,
-        peak_eps: float = 0.1,
-        peak_use_relative_error: bool = True,
+        peak_weight: float = 1.0,
+        peak_eps: float = 0.5,
+        peak_min_valid_count: int = 100,
+        peak_min_peak_count: int = 10,
+        peak_huber_beta: float = 1.0,
     ) -> None:
         super().__init__(
             w_q=w_q,
@@ -576,7 +607,9 @@ class HydroMFMLoss(_BaseHydroLoss):
             quantile=peak_quantile,
             weight=peak_weight,
             eps=peak_eps,
-            use_relative_error=peak_use_relative_error,
+            min_valid_count=peak_min_valid_count,
+            min_peak_count=peak_min_peak_count,
+            huber_beta=peak_huber_beta,
         )
 
     def forward(

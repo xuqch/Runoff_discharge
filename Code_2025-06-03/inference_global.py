@@ -135,12 +135,16 @@ def infer(
     infer_end_year: Optional[int] = None,
     device: Optional[str] = None,
     grid_batch_size: int = 1,
+    generator_chunk_size: int | None = None,
+    inference_compression_level: int = 1,
 ) -> None:
     import torch
 
     area_dir = Path(area_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if not 0 <= int(inference_compression_level) <= 9:
+        raise ValueError("inference_compression_level must be between 0 and 9.")
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     dev = torch.device(device)
@@ -256,6 +260,7 @@ def infer(
                 x_dyn_year_batch=x_dyn_year[batch_start:batch_end],
                 x_stat_batch=x_stat[batch_start:batch_end],
                 seq_len=seq_len_used,
+                generator_chunk_size=generator_chunk_size,
             )
             runoff_flat[:, valid_linear_idx[batch_start:batch_end]] = preds.T
 
@@ -281,14 +286,11 @@ def infer(
                 "grid_batch_size": int(grid_batch_size),
             },
         )
-        encoding = {
-            "runoff": {
-                "zlib": True,
-                "complevel": 4,
-                "dtype": "float32",
-                "_FillValue": np.float32(np.nan),
-            }
-        }
+        encoding = {"runoff": {"dtype": "float32", "_FillValue": np.float32(np.nan)}}
+        if int(inference_compression_level) > 0:
+            encoding["runoff"].update(
+                {"zlib": True, "complevel": int(inference_compression_level)}
+            )
         out_path = out_dir / f"Area_{year}.nc"
         out.to_netcdf(out_path, encoding=encoding)
         print(f"[inference] saved yearly output: {out_path}")
@@ -314,6 +316,8 @@ def interfere(cfg: Dict) -> None:
         infer_end_year=cfg.get("infer_end_year"),
         device=cfg["device"],
         grid_batch_size=int(cfg.get("grid_batch_size", 1)),
+        generator_chunk_size=int(cfg.get("generator_chunk_size", 0)) or None,
+        inference_compression_level=int(cfg.get("inference_compression_level", 1)),
     )
 
 

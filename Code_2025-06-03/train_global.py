@@ -112,6 +112,7 @@ def _progress_postfix(loss_value: float, metrics: Dict[str, float], route_metric
         "loss": f"{loss_value:.3g}",
         "mb": f"{float(metrics.get('loss_mb', metrics.get('mb', 0.0))):.3g}",
         "q": f"{float(metrics.get('loss_q', metrics.get('q_loss', 0.0))):.3g}",
+        "peak": f"{float(metrics.get('loss_peak', 0.0)):.3g}",
         "route": f"{float(route_metrics.get('loss_route_total', route_metrics.get('route_loss', 0.0))):.3g}",
         "v_mean": "-" if v_mean_value is None else f"{v_mean_value:.3g}",
     }
@@ -267,6 +268,149 @@ def _path_with_rank(path: Path, rank: int) -> Path:
     if suffix:
         return path.with_name(f"{path.stem}.rank{rank}{suffix}")
     return path.with_name(f"{path.name}.rank{rank}.csv")
+
+
+class LossComponentLogger:
+    fields = [
+        "rank",
+        "epoch",
+        "step_in_epoch",
+        "global_step",
+        "lr_gen",
+        "lr_vel",
+        "loss_total_step",
+        "loss_data_step",
+        "loss_total_from_criterion",
+        "loss_q",
+        "loss_q_mfm",
+        "loss_peak_raw",
+        "loss_peak_contrib",
+        "loss_mb",
+        "loss_route_total",
+        "loss_route_mass",
+        "loss_route_sigma_monotonic",
+        "loss_route_hillslope_ratio",
+        "loss_route_velocity_smooth",
+        "loss_route_sigma_width",
+        "loss_route_dispersion_coupling",
+        "loss_route_effective_lag",
+        "w_q",
+        "w_peak",
+        "w_balance",
+        "w_route",
+        "lag_mean",
+        "v_mean",
+        "basin_ids",
+        "sample_ids",
+        "block_starts",
+        "block_ends",
+        "valid_target_counts",
+    ]
+
+    def __init__(self, cfg: Dict, rank: int) -> None:
+        self.interval = max(1, int(cfg.get("loss_log_interval", 1)))
+        self.flush_interval = max(1, int(cfg.get("loss_log_flush_interval", 100)))
+        self.rank = int(rank)
+        self.rows_since_flush = 0
+        self.file = None
+        self.writer = None
+        if not bool(cfg.get("write_loss_log", False)):
+            self.path = None
+            return
+        raw_path = str(cfg.get("loss_log_file", "") or "")
+        self.path = _path_with_rank(Path(raw_path), self.rank) if raw_path else Path(cfg["out_dir"]) / f"loss_components_rank{self.rank}.csv"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(self.path, "w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.fields)
+        self.writer.writeheader()
+        self.file.flush()
+
+    def enabled(self, step_in_epoch: int) -> bool:
+        return self.writer is not None and step_in_epoch % self.interval == 0
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.flush()
+            self.file.close()
+            self.file = None
+            self.writer = None
+
+    @staticmethod
+    def _join_meta_values(basin_meta: List[Dict], key: str) -> str:
+        values = []
+        for meta in basin_meta:
+            value = meta.get(key, "")
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    value = ""
+                else:
+                    value = value.detach().reshape(-1)[0].cpu().item()
+            values.append(str(value))
+        return "|".join(values)
+
+    @staticmethod
+    def _mean_route_aux(outputs: Dict, keys: tuple[str, ...]):
+        return _mean_aux_value(outputs.get("route_aux", []), keys)
+
+    def log(
+        self,
+        *,
+        cfg: Dict,
+        epoch: int,
+        step_in_epoch: int,
+        global_step: int,
+        optimizer: torch.optim.Optimizer,
+        loss_value: float,
+        data_loss,
+        metrics: Dict,
+        route_loss,
+        route_metrics: Dict,
+        outputs: Dict,
+        basin_meta: List[Dict],
+    ) -> None:
+        if not self.enabled(step_in_epoch):
+            return
+        peak_raw = float(metrics.get("loss_peak", 0.0))
+        row = {
+            "rank": self.rank,
+            "epoch": int(epoch),
+            "step_in_epoch": int(step_in_epoch),
+            "global_step": int(global_step),
+            "lr_gen": float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else "",
+            "lr_vel": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else "",
+            "loss_total_step": float(loss_value),
+            "loss_data_step": _safe_float(data_loss, default=""),
+            "loss_total_from_criterion": _first_metric(metrics, ("loss_total",), default=""),
+            "loss_q": _first_metric(metrics, ("loss_q", "q_loss"), default=""),
+            "loss_q_mfm": _first_metric(metrics, ("loss_q_mfm",), default=""),
+            "loss_peak_raw": peak_raw,
+            "loss_peak_contrib": float(cfg.get("w_peak", 0.0)) * peak_raw,
+            "loss_mb": _first_metric(metrics, ("loss_mb", "mb"), default=""),
+            "loss_route_total": _first_metric(route_metrics, ("loss_route_total", "route_loss"), default=_safe_float(route_loss, default="")),
+            "loss_route_mass": _first_metric(route_metrics, ("loss_route_mass",), default=""),
+            "loss_route_sigma_monotonic": _first_metric(route_metrics, ("loss_route_sigma_monotonic",), default=""),
+            "loss_route_hillslope_ratio": _first_metric(route_metrics, ("loss_route_hillslope_ratio",), default=""),
+            "loss_route_velocity_smooth": _first_metric(route_metrics, ("loss_route_velocity_smooth",), default=""),
+            "loss_route_sigma_width": _first_metric(route_metrics, ("loss_route_sigma_width",), default=""),
+            "loss_route_dispersion_coupling": _first_metric(route_metrics, ("loss_route_dispersion_coupling",), default=""),
+            "loss_route_effective_lag": _first_metric(route_metrics, ("loss_route_effective_lag",), default=""),
+            "w_q": float(cfg.get("w_q", 1.0)),
+            "w_peak": float(cfg.get("w_peak", 0.0)),
+            "w_balance": float(cfg.get("w_balance", 0.0)),
+            "w_route": float(cfg.get("w_route", 1.0)),
+            "lag_mean": self._mean_route_aux(outputs, ("lag", "lag_mean", "lag_days", "total_lag_days", "channel_lag_days", "lag_len")),
+            "v_mean": self._mean_route_aux(outputs, ("v_mean", "velocity_mean", "mean_velocity", "velocity_mps")),
+            "basin_ids": self._join_meta_values(basin_meta, "basin_id"),
+            "sample_ids": self._join_meta_values(basin_meta, "sample_id"),
+            "block_starts": self._join_meta_values(basin_meta, "block_start"),
+            "block_ends": self._join_meta_values(basin_meta, "block_end"),
+            "valid_target_counts": self._join_meta_values(basin_meta, "valid_target_count"),
+        }
+        self.writer.writerow(row)
+        self.rows_since_flush += 1
+        if self.rows_since_flush >= self.flush_interval:
+            self.file.flush()
+            self.rows_since_flush = 0
 
 
 def write_last_block_diagnostics(dataset, out_csv_path: str | Path) -> None:
@@ -600,12 +744,34 @@ class HighLossLogger:
         }
 
 
-def reduce_epoch_stats(loss_sum: float, step_count: int, device: torch.device) -> tuple[float, int]:
+def reduce_epoch_stats(component_sums: Dict[str, float], step_count: int, device: torch.device) -> tuple[Dict[str, float], int]:
+    keys = ["loss", "q", "peak_raw", "peak_contrib", "mb", "route"]
+    values = [float(component_sums.get(key, 0.0)) for key in keys] + [float(step_count)]
     if dist.is_available() and dist.is_initialized():
-        tensor = torch.tensor([loss_sum, float(step_count)], dtype=torch.float64, device=device)
+        tensor = torch.tensor(values, dtype=torch.float64, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        return float(tensor[0].item()), int(tensor[1].item())
-    return loss_sum, step_count
+        reduced = {key: float(tensor[i].item()) for i, key in enumerate(keys)}
+        return reduced, int(tensor[-1].item())
+    return {key: float(component_sums.get(key, 0.0)) for key in keys}, step_count
+
+
+def checkpoint_monitor_loss(cfg: Dict, epoch_metrics: Dict[str, float]) -> float:
+    return (
+        float(cfg.get("w_q", 1.0)) * float(epoch_metrics.get("q", 0.0))
+        + float(cfg.get("w_balance", 0.0)) * float(epoch_metrics.get("mb", 0.0))
+        + float(epoch_metrics.get("route", 0.0))
+    )
+
+
+def print_peak_loss_config(cfg: Dict) -> None:
+    print("[PeakFlowLoss]", flush=True)
+    print("mode=bounded_huber", flush=True)
+    print(f"quantile={float(cfg.get('peak_quantile', 0.9))}", flush=True)
+    print(f"min_valid_count={int(cfg.get('peak_min_valid_count', 100))}", flush=True)
+    print(f"min_peak_count={int(cfg.get('peak_min_peak_count', 10))}", flush=True)
+    print(f"huber_beta={float(cfg.get('peak_huber_beta', 1.0))}", flush=True)
+    print(f"peak_weight={float(cfg.get('peak_weight', 1.0))}", flush=True)
+    print(f"outer_w_peak={float(cfg.get('w_peak', 0.0))}", flush=True)
 
 
 def shutdown_dataloader(loader) -> None:
@@ -639,10 +805,11 @@ def train_one_epoch(
     device: torch.device,
     global_step: int,
     high_loss_logger: HighLossLogger | None = None,
-) -> tuple[float, int]:
+    loss_component_logger: LossComponentLogger | None = None,
+) -> tuple[Dict[str, float], int]:
     model.train()
     route_w = route_weights(cfg)
-    loss_sum = 0.0
+    component_sums = {"loss": 0.0, "q": 0.0, "peak_raw": 0.0, "peak_contrib": 0.0, "mb": 0.0, "route": 0.0}
     step_count = 0
     use_amp = bool(cfg.get("use_amp", False)) and device.type == "cuda"
     progress = tqdm(loader, desc=f"epoch {epoch}", disable=not is_main_process(), dynamic_ncols=True)
@@ -703,15 +870,37 @@ def train_one_epoch(
                 outputs=outputs,
                 basin_meta=basin_meta,
             )
-        loss_sum += loss_value
+        if loss_component_logger is not None:
+            loss_component_logger.log(
+                cfg=cfg,
+                epoch=epoch,
+                step_in_epoch=step_in_epoch,
+                global_step=global_step,
+                optimizer=optimizer,
+                loss_value=loss_value,
+                data_loss=data_loss,
+                metrics=metrics,
+                route_loss=route_loss,
+                route_metrics=route_metrics,
+                outputs=outputs,
+                basin_meta=basin_meta,
+            )
+        component_sums["loss"] += loss_value
+        component_sums["q"] += float(metrics.get("loss_q", 0.0))
+        peak_raw = float(metrics.get("loss_peak", 0.0))
+        component_sums["peak_raw"] += peak_raw
+        component_sums["peak_contrib"] += float(cfg.get("w_peak", 0.0)) * peak_raw
+        component_sums["mb"] += float(metrics.get("loss_mb", 0.0))
+        component_sums["route"] += float(route_metrics.get("loss_route_total", 0.0))
         if is_main_process() and step_in_epoch % int(cfg.get("log_interval", 10)) == 0:
             progress.set_postfix(_progress_postfix(loss_value, metrics, route_metrics, outputs))
         maybe_empty_cuda_cache(global_step, enabled=bool(cfg.get("clear_cache", False)), interval=int(cfg.get("empty_cache_interval", 20)))
         del outputs, data_loss, route_loss, loss, metrics, route_metrics
 
-    reduced_loss_sum, reduced_steps = reduce_epoch_stats(loss_sum, step_count, device)
-    epoch_loss = reduced_loss_sum / max(reduced_steps, 1)
-    return epoch_loss, global_step
+    reduced_sums, reduced_steps = reduce_epoch_stats(component_sums, step_count, device)
+    denom = max(reduced_steps, 1)
+    epoch_metrics = {key: value / denom for key, value in reduced_sums.items()}
+    return epoch_metrics, global_step
 
 
 def train(cfg: Dict) -> None:
@@ -729,6 +918,7 @@ def train(cfg: Dict) -> None:
     dataset = None
     loader = None
     sampler = None
+    loss_component_logger = None
     normal_completed = False
 
     try:
@@ -748,9 +938,14 @@ def train(cfg: Dict) -> None:
         model = build_model(cfg, device)
         optimizer = build_optimizer(cfg, model)
         high_loss_logger = HighLossLogger(cfg, rank) if float(cfg.get("debug_loss_threshold", 0.0)) > 0 else None
+        loss_component_logger = LossComponentLogger(cfg, rank)
+        if loss_component_logger.path is not None:
+            print(f"[loss-log] writing component losses to {loss_component_logger.path}", flush=True)
         # scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.get("use_amp", False)) and device.type == "cuda")
         scaler = torch.amp.GradScaler( "cuda",enabled=bool(cfg.get("use_amp", False)) and device.type == "cuda",)
         criterion = build_criterion(cfg)
+        if is_main_process() and str(cfg.get("Loss", "")).upper() == "MFM":
+            print_peak_loss_config(cfg)
 
         resume_path = resolve_resume_path(cfg)
         start_epoch = 1
@@ -762,12 +957,25 @@ def train(cfg: Dict) -> None:
             completed_epoch = int(ckpt.get("completed_epoch", ckpt.get("epoch", 0)))
             start_epoch = completed_epoch + 1
             global_step = int(ckpt.get("global_step", 0))
-            best_loss = float(ckpt.get("best_loss", float("inf")))
-            best_epoch = int(ckpt.get("best_epoch", ckpt.get("completed_epoch", 0)))
+            previous_cfg = ckpt.get("config", {}) or {}
+            previous_metric = previous_cfg.get("best_checkpoint_metric")
+            if previous_metric == "q_balance_route":
+                best_loss = float(ckpt.get("best_loss", float("inf")))
+                best_epoch = int(ckpt.get("best_epoch", ckpt.get("completed_epoch", 0)))
+            else:
+                best_loss = float("inf")
+                best_epoch = 0
             if is_main_process():
+                if previous_metric != "q_balance_route":
+                    print(
+                        "[resume] previous checkpoint used a different best-model metric; "
+                        "best monitor state was reset.",
+                        flush=True,
+                    )
                 print(
                     f"[resume] loaded {resume_path}; start_epoch={start_epoch}, "
-                    f"global_step={global_step}, best_epoch={best_epoch}, best_loss={best_loss:.6f}"
+                    f"global_step={global_step}, best_epoch={best_epoch}, "
+                    f"best_monitor_loss={best_loss:.6f}"
                 )
 
         if ddp_enabled and device.type == "cuda":
@@ -796,7 +1004,7 @@ def train(cfg: Dict) -> None:
                     f"lr_gen={optimizer.param_groups[0]['lr']:.2e} "
                     f"lr_vel={optimizer.param_groups[1]['lr']:.2e}"
                 )
-            epoch_loss, global_step = train_one_epoch(
+            epoch_metrics, global_step = train_one_epoch(
                 cfg=cfg,
                 epoch=epoch,
                 model=model,
@@ -807,11 +1015,23 @@ def train(cfg: Dict) -> None:
                 device=device,
                 global_step=global_step,
                 high_loss_logger=high_loss_logger,
+                loss_component_logger=loss_component_logger,
             )
+            epoch_loss = float(epoch_metrics.get("loss", 0.0))
+            monitor_loss = checkpoint_monitor_loss(cfg, epoch_metrics)
             if is_main_process():
-                print(f"Epoch {epoch:03d} finished: total_loss={epoch_loss:.6f}")
-                if epoch_loss < best_loss:
-                    best_loss = epoch_loss
+                print(
+                    f"Epoch {epoch:03d} finished: total_loss={epoch_loss:.6f} "
+                    f"monitor_loss={monitor_loss:.6f} "
+                    f"q={epoch_metrics.get('q', 0.0):.6f} "
+                    f"peak_raw={epoch_metrics.get('peak_raw', 0.0):.6f} "
+                    f"peak_contrib={epoch_metrics.get('peak_contrib', 0.0):.6f} "
+                    f"mb={epoch_metrics.get('mb', 0.0):.6f} "
+                    f"route={epoch_metrics.get('route', 0.0):.6f}"
+                )
+                is_new_best = monitor_loss < best_loss
+                if is_new_best:
+                    best_loss = monitor_loss
                     best_epoch = epoch
                 ckpt_path = cfg["ckpt_dir"] / f"ckpt_epoch{epoch:03d}.pth"
                 latest_path = cfg["ckpt_dir"] / "latest.pth"
@@ -831,7 +1051,7 @@ def train(cfg: Dict) -> None:
                 print(f"Saved checkpoint: {ckpt_path}")
                 shutil.copy2(ckpt_path, latest_path)
                 print(f"Updated latest checkpoint: {latest_path}")
-                if best_epoch == epoch:
+                if is_new_best:
                     save_checkpoint(
                         best_path,
                         model=model,
@@ -844,30 +1064,39 @@ def train(cfg: Dict) -> None:
                         config=cfg,
                     )
                     print(f"Updated best model: {best_path}")
-                print(f"Best epoch: {best_epoch}, best_loss={best_loss:.6f}")
+                print(
+                    f"Best epoch: {best_epoch}, "
+                    f"best_monitor_loss={best_loss:.6f}, monitor=q_balance_route"
+                )
             if ddp_enabled:
                 ddp_barrier(local_rank)
         normal_completed = True
     finally:
+        is_rank0 = rank == 0
+        if loss_component_logger is not None:
+            loss_component_logger.close()
+        shutdown_dataloader(loader)
         if torch.cuda.is_available():
             try:
                 torch.cuda.synchronize(device if device.type == "cuda" else None)
-            except Exception:
-                pass
-        shutdown_dataloader(loader)
+            except Exception as exc:
+                print(f"[cleanup] CUDA synchronize warning: {exc}", flush=True)
+        if ddp_enabled and dist.is_available() and dist.is_initialized():
+            try:
+                ddp_barrier(local_rank)
+            except Exception as exc:
+                print(f"[cleanup] final barrier warning on rank {rank}: {exc}", flush=True)
+        cleanup_distributed()
         try:
             del loader
             del dataset
             del sampler
         except Exception:
             pass
-        if ddp_enabled and normal_completed:
-            ddp_barrier(local_rank)
-        cleanup_distributed()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if normal_completed and rank == 0:
-            print("Training finished.")
+        if normal_completed and is_rank0:
+            print("Training finished.", flush=True)
 
 
 def main() -> None:

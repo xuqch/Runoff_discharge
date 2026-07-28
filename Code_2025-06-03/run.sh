@@ -5,6 +5,65 @@ set -euo pipefail
 #CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 bash run.sh
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+#bash "$SCRIPT_DIR/launch_ddp_train.sh" \
+#  --use_amp \
+#  --num_workers 4 \
+#  --pin_memory \
+#  --persistent_workers \
+#  --basin_batch_size 1 \
+#  --target_block_size 768 \
+#  --target_block_stride 768 \
+#  --generator_chunk_size 16384 \
+#  --balanced_bucket_size 64 \
+#  --empty_cache_interval 80 \
+#  --epochs 30 \
+#  --Loss NSEstd \
+#  --max_lag -1 \
+#  --basins_file 'basins_for_test3.csv' \
+#  --data_dir '/share/home/dq083/Runoff/LSTM/Experiment_for_runoff/Global/' \
+#  --scalers_path 'scalers_Global.json' \
+#  "$@"
+#
+#bash "$SCRIPT_DIR/launch_ddp_train.sh" \
+#  --use_amp \
+#  --num_workers 4 \
+#  --pin_memory \
+#  --persistent_workers \
+#  --basin_batch_size 1 \
+#  --target_block_size 768 \
+#  --target_block_stride 768 \
+#  --generator_chunk_size 16384 \
+#  --balanced_bucket_size 64 \
+#  --empty_cache_interval 80 \
+#  --epochs 1 \
+#  --Loss NSEstd \
+#  --max_lag -1 \
+#  --basins_file 'basins_for_train_ealstm_B.csv' \
+#  --data_dir '/share/home/dq083/Runoff/LSTM/Experiment_for_runoff/Global/' \
+#  --scalers_path 'scalers_Global.json' \
+#  "$@"
+# Basins for P from 500-1000 ok
+
+#bash "$SCRIPT_DIR/launch_ddp_train.sh" \
+#  --use_amp \
+#  --num_workers 4 \
+#  --pin_memory \
+#  --persistent_workers \
+#  --basin_batch_size 1 \
+#  --target_block_size 768 \
+#  --target_block_stride 768 \
+#  --generator_chunk_size 16384 \
+#  --balanced_bucket_size 64 \
+#  --empty_cache_interval 80 \
+#  --epochs 30 \
+#  --Loss NSEstd \
+#  --max_lag -1 \
+#  --basins_file 'basins_for_train_ealstm_C.csv' \
+#  --data_dir '/share/home/dq083/Runoff/LSTM/Experiment_for_runoff/Global/' \
+#  --scalers_path 'scalers_Global.json' \
+#  "$@"
+## Basins for P from 1000-2000 ok
+#
 bash "$SCRIPT_DIR/launch_ddp_train.sh" \
   --use_amp \
   --num_workers 4 \
@@ -16,14 +75,16 @@ bash "$SCRIPT_DIR/launch_ddp_train.sh" \
   --generator_chunk_size 16384 \
   --balanced_bucket_size 64 \
   --empty_cache_interval 80 \
-  --epochs 30 \
+  --epochs 1 \
   --Loss NSEstd \
   --max_lag -1 \
-  --basins_file 'basins_for_test3.csv' \
+  --basins_file 'basins_for_train_ealstm_D.csv' \
   --data_dir '/share/home/dq083/Runoff/LSTM/Experiment_for_runoff/Global/' \
   --scalers_path 'scalers_Global.json' \
   "$@"
-
+## Basins for P from 2000-5000
+#问题1：关不掉，半小时了没停止程序
+#问题二，又出现了创建两次run_dir的情况
 
 #  --use_amp \
 #  --num_workers 8  \

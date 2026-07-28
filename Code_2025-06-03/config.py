@@ -43,6 +43,8 @@ def get_args() -> Dict:
 
     parser.add_argument("--data_dir", type=str, default="/data/xuqch3/LSTM_Runoff/Experiment_for_runoff/Global")
     parser.add_argument("--basins_file", type=str, default="basins_for_train.csv")
+    parser.add_argument("--train_basins_file", type=str, default=None)
+    parser.add_argument("--eval_basins_file", type=str, default=None)
     parser.add_argument("--nc_dir", type=str, default=None)
     parser.add_argument("--h5_dir", type=str, default="ealstm_h5")
     parser.add_argument("--eval_h5_dir", type=str, default="ealstm_validation")
@@ -109,7 +111,7 @@ def get_args() -> Dict:
     parser.add_argument("--Loss", type=str, default="NSEstd", choices=["NSEstd", "MFM"])
     parser.add_argument("--w_q", type=float, default=1.0)
     parser.add_argument("--w_mfm", type=float, default=1.0)
-    parser.add_argument("--w_peak", type=float, default=0.0)
+    parser.add_argument("--w_peak", type=float, default=0.05)
     parser.add_argument("--w_balance", type=float, default=0.1)
     parser.add_argument("--w_route", type=float, default=1.0)
     parser.add_argument("--w_budyko", type=float, default=None)
@@ -125,9 +127,17 @@ def get_args() -> Dict:
     parser.add_argument("--mfm_eps", type=float, default=1e-6)
     parser.add_argument("--mfm_soft_hist_sigma_scale", type=float, default=0.5)
     parser.add_argument("--peak_quantile", type=float, default=0.9)
-    parser.add_argument("--peak_weight", type=float, default=2.0)
-    parser.add_argument("--peak_eps", type=float, default=0.1)
-    parser.add_argument("--peak_use_relative_error", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--peak_weight", type=float, default=1.0)
+    parser.add_argument("--peak_eps", type=float, default=0.5)
+    parser.add_argument("--peak_min_valid_count", type=int, default=100)
+    parser.add_argument("--peak_min_peak_count", type=int, default=10)
+    parser.add_argument("--peak_huber_beta", type=float, default=1.0)
+    parser.add_argument(
+        "--peak_use_relative_error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Deprecated compatibility flag; PeakFlowLoss always uses bounded Huber.",
+    )
 
     parser.add_argument("--balanced_sampler", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--balanced_bucket_size", type=int, default=16)
@@ -138,6 +148,12 @@ def get_args() -> Dict:
     parser.add_argument("--grid_batch_size", type=int, default=1)
     parser.add_argument("--inference_num_workers", type=int, default=0)
     parser.add_argument("--inference_tmp_dir", type=str, default=None)
+    parser.add_argument(
+        "--inference_compression_level",
+        type=int,
+        default=1,
+        help="NetCDF zlib compression level for inference outputs (0 disables compression; 1 is fast).",
+    )
     parser.add_argument("--cuda_devices", type=str, default=None)
     parser.add_argument("--keep_inference_parts", action=argparse.BooleanOptionalAction, default=False)
 
@@ -157,17 +173,46 @@ def get_args() -> Dict:
     parser.add_argument("--debug_loss_max_records", type=int, default=2000)
     parser.add_argument("--debug_loss_print_limit", type=int, default=50)
     parser.add_argument("--debug_loss_log_file", type=str, default="")
+    parser.add_argument("--write_loss_log", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss_log_file", type=str, default="")
+    parser.add_argument("--loss_log_interval", type=int, default=1)
+    parser.add_argument("--loss_log_flush_interval", type=int, default=100)
+    parser.add_argument("--plot_max_basins", type=int, default=100)
     parser.add_argument("--info", type=str, default=None)
 
     args = parser.parse_args()
     cfg = vars(args)
+    _validate_peak_args(cfg)
     cfg["_explicit_keys"] = _collect_explicit_keys(parser)
     return cfg
 
 
+def _validate_peak_args(cfg: Dict) -> None:
+    peak_quantile = float(cfg.get("peak_quantile", 0.9))
+    if not 0.0 < peak_quantile < 1.0:
+        raise ValueError("peak_quantile must satisfy 0 < peak_quantile < 1.")
+    if int(cfg.get("peak_min_valid_count", 100)) < 1:
+        raise ValueError("peak_min_valid_count must be at least 1.")
+    if int(cfg.get("peak_min_peak_count", 10)) < 1:
+        raise ValueError("peak_min_peak_count must be at least 1.")
+    if float(cfg.get("peak_huber_beta", 1.0)) <= 0.0:
+        raise ValueError("peak_huber_beta must be greater than 0.")
+    if float(cfg.get("peak_eps", 0.5)) <= 0.0:
+        raise ValueError("peak_eps must be greater than 0.")
+
+
 def _merge_saved_config(cfg: Dict, saved_cfg: Dict) -> None:
     explicit = cfg.get("_explicit_keys", set())
-    transient = {"resume_ckpt", "resume_latest", "eval_ckpt", "eval_model", "eval_split"}
+    transient = {
+        "resume_ckpt",
+        "resume_latest",
+        "eval_ckpt",
+        "eval_model",
+        "eval_split",
+        "eval_basins_file",
+        "train_basins_file",
+        "eval_h5_dir",
+    }
     for key, value in saved_cfg.items():
         if key.startswith("_") or key in transient or key in explicit:
             continue
@@ -265,7 +310,15 @@ def update_config(cfg: Dict) -> Dict:
         cfg["ckpt_dir"] = cfg["run_dir"] / "checkpoints"
 
     cfg["basins_file"] = _resolve_file(cfg["basins_file"], code_dir / "data", data_dir, code_dir.parent)
-    cfg["q_file"] = cfg["basins_file"]
+    if cfg.get("train_basins_file") is None:
+        cfg["train_basins_file"] = cfg["basins_file"]
+    else:
+        cfg["train_basins_file"] = _resolve_file(cfg["train_basins_file"], code_dir / "data", data_dir, code_dir.parent)
+    if cfg.get("eval_basins_file") is None:
+        cfg["eval_basins_file"] = cfg["basins_file"]
+    else:
+        cfg["eval_basins_file"] = _resolve_file(cfg["eval_basins_file"], code_dir / "data", data_dir, code_dir.parent)
+    cfg["q_file"] = cfg["train_basins_file"]
     cfg["nc_dir"] = Path(cfg["nc_dir"]) if cfg.get("nc_dir") else data_dir / "Basins_data"
 
     explicit = cfg.get("_explicit_keys", set())
@@ -295,6 +348,8 @@ def update_config(cfg: Dict) -> Dict:
     if cfg.get("lr_vel") is None:
         cfg["lr_vel"] = float(cfg["lr"])
     cfg["basin_batch_size"] = int(cfg.get("basin_batch_size") or cfg.get("batch_size") or 1)
+    cfg["best_checkpoint_metric"] = "q_balance_route"
+    _validate_peak_args(cfg)
     return cfg
 
 
